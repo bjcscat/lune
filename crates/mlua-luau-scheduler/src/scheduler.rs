@@ -8,7 +8,7 @@ use std::{
     thread::panicking,
 };
 
-use futures_lite::prelude::*;
+use futures_lite::{future::yield_now, prelude::*};
 use mlua::prelude::*;
 
 use async_executor::{Executor, LocalExecutor};
@@ -373,7 +373,16 @@ impl<'lua> Scheduler<'lua> {
                             .race(fut_spawn)
                             .race(fut_defer)
                             .race(fut_futs)
-                            .race(local_exec.tick()),
+                            .race(
+                                async {
+                                    yield_now().await;
+
+                                    while !local_exec.is_empty() {
+                                        yield_now().await;
+                                    }
+                                }
+                                .or(local_exec.tick()),
+                            ),
                     )
                     .await;
 
@@ -417,7 +426,6 @@ impl<'lua> Scheduler<'lua> {
 
                 trace!(
                     futures_spawned = num_futures,
-                    // futures_processed = num_processed,
                     lua_threads_spawned = num_spawned,
                     lua_threads_deferred = num_deferred,
                     "loop"
