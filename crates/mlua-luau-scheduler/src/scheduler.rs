@@ -8,11 +8,11 @@ use std::{
     thread::panicking,
 };
 
-use futures_lite::prelude::*;
+use futures_lite::{future::yield_now, prelude::*};
 use mlua::prelude::*;
 
 use async_executor::{Executor, LocalExecutor};
-use tracing::{debug, instrument, trace, trace_span, Instrument};
+use tracing::{debug, instrument, trace, trace_span};
 
 use crate::{
     error_callback::ThreadErrorCallback,
@@ -367,25 +367,23 @@ impl<'lua> Scheduler<'lua> {
                 let fut_defer = self.queue_defer.wait_for_item(); // 3
                 let fut_futs = fut_queue.wait_for_item(); // 4
 
-                // 5
-                let mut num_processed = 0;
-                let span_tick = trace_span!("Scheduler::tick");
-                let fut_tick = async {
-                    local_exec.tick().await;
-                    // NOTE: Try to do as much work as possible instead of just a single tick()
-                    num_processed += 1;
-                    while local_exec.try_tick() {
-                        num_processed += 1;
-                    }
-                };
+                if !local_exec.is_empty() {
+                    // pull in luau functions if scheduled
+                    local_exec.try_tick();
 
+                    local_exec
+                        .run(fut_exit.or(fut_spawn).or(fut_defer).or(fut_futs).or(async {
+                            loop {
+                                if local_exec.is_empty() {
+                                    break;
+                                }
+
+                                yield_now().await;
+                            }
+                        }))
+                        .await;
+                }
                 // 1 + 2 + 3 + 4 + 5
-                fut_exit
-                    .or(fut_spawn)
-                    .or(fut_defer)
-                    .or(fut_futs)
-                    .or(fut_tick.instrument(span_tick.or_current()))
-                    .await;
 
                 // Check if we should exit
                 if self.exit.get().is_some() {
@@ -414,6 +412,7 @@ impl<'lua> Scheduler<'lua> {
                 {
                     let _span = trace_span!("Scheduler::drain_futures").entered();
                     for fut in fut_queue.drain_items() {
+                        dbg!("Spawned");
                         local_exec.spawn(fut).detach();
                         num_futures += 1;
                     }
@@ -426,7 +425,6 @@ impl<'lua> Scheduler<'lua> {
                     && self.queue_defer.is_empty();
                 trace!(
                     futures_spawned = num_futures,
-                    futures_processed = num_processed,
                     lua_threads_spawned = num_spawned,
                     lua_threads_deferred = num_deferred,
                     "loop"
